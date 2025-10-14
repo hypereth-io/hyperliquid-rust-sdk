@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     ops::DerefMut,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
     },
     time::Duration,
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     net::TcpStream,
     spawn,
-    sync::{mpsc::UnboundedSender, Mutex},
+    sync::{mpsc::UnboundedSender, oneshot, Mutex},
     time,
 };
 use tokio_tungstenite::{
@@ -42,12 +42,15 @@ struct SubscriptionData {
     id: String,
 }
 #[derive(Debug)]
-pub(crate) struct WsManager {
+pub struct WsManager {
     stop_flag: Arc<AtomicBool>,
     writer: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, protocol::Message>>>,
     subscriptions: Arc<Mutex<HashMap<String, Vec<SubscriptionData>>>>,
     subscription_id: u32,
     subscription_identifiers: HashMap<u32, String>,
+    // Request/response tracking
+    request_counter: Arc<AtomicU32>,
+    pending_requests: Arc<Mutex<HashMap<u32, oneshot::Sender<serde_json::Value>>>>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -109,7 +112,7 @@ pub(crate) struct Ping {
 impl WsManager {
     const SEND_PING_INTERVAL: u64 = 50;
 
-    pub(crate) async fn new(url: String, reconnect: bool) -> Result<WsManager> {
+    pub async fn new(url: String, reconnect: bool) -> Result<WsManager> {
         let stop_flag = Arc::new(AtomicBool::new(false));
 
         let (writer, mut reader) = Self::connect(&url).await?.split();
@@ -119,14 +122,21 @@ impl WsManager {
         let subscriptions = Arc::new(Mutex::new(subscriptions_map));
         let subscriptions_copy = Arc::clone(&subscriptions);
 
+        let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+        let pending_requests_copy = Arc::clone(&pending_requests);
+
         {
             let writer = writer.clone();
             let stop_flag = Arc::clone(&stop_flag);
             let reader_fut = async move {
                 while !stop_flag.load(Ordering::Relaxed) {
                     if let Some(data) = reader.next().await {
-                        if let Err(err) =
-                            WsManager::parse_and_send_data(data, &subscriptions_copy).await
+                        if let Err(err) = WsManager::parse_and_send_data(
+                            data,
+                            &subscriptions_copy,
+                            &pending_requests_copy,
+                        )
+                        .await
                         {
                             error!("Error processing data received by WsManager reader: {err}");
                         }
@@ -216,6 +226,8 @@ impl WsManager {
             subscriptions,
             subscription_id: 0,
             subscription_identifiers: HashMap::new(),
+            request_counter: Arc::new(AtomicU32::new(0)),
+            pending_requests,
         })
     }
 
@@ -302,6 +314,9 @@ impl WsManager {
     async fn parse_and_send_data(
         data: std::result::Result<protocol::Message, tungstenite::Error>,
         subscriptions: &Arc<Mutex<HashMap<String, Vec<SubscriptionData>>>>,
+        pending_requests: &Arc<
+            Mutex<HashMap<u32, tokio::sync::oneshot::Sender<serde_json::Value>>>,
+        >,
     ) -> Result<()> {
         match data {
             Ok(data) => match data.into_text() {
@@ -309,6 +324,73 @@ impl WsManager {
                     if !data.starts_with('{') {
                         return Ok(());
                     }
+
+                    // Try to parse as general JSON first to check for POST responses
+                    let json_data: serde_json::Value =
+                        serde_json::from_str(&data).map_err(|e| Error::JsonParse(e.to_string()))?;
+
+                    // Handle POST method responses (success and error cases)
+                    if let Some(channel) = json_data.get("channel") {
+                        if channel == "post" {
+                            if let Some(response_data) = json_data.get("data") {
+                                if let Some(request_id) =
+                                    response_data.get("id").and_then(|id| id.as_u64())
+                                {
+                                    let mut pending = pending_requests.lock().await;
+                                    if let Some(sender) = pending.remove(&(request_id as u32)) {
+                                        let _ = sender.send(response_data.clone());
+                                    }
+                                }
+                            }
+                            return Ok(());
+                        } else if channel == "error" {
+                            // Handle error responses - try to extract request ID from the error data
+                            if let Some(error_msg) = json_data.get("data").and_then(|d| d.as_str())
+                            {
+                                log::warn!("WebSocket POST error: {}", error_msg);
+                                // Try to extract request ID from the error message
+                                // The error message contains the original request as JSON
+                                if error_msg.contains("\"id\":") {
+                                    // Use regex or string parsing to find the request ID
+                                    if let Some(id_start) = error_msg.find("\"id\":") {
+                                        let id_substr = &error_msg[id_start + 5..];
+                                        if let Some(comma_pos) = id_substr.find(',') {
+                                            let id_str = &id_substr[..comma_pos];
+                                            if let Ok(request_id) = id_str.parse::<u32>() {
+                                                let mut pending = pending_requests.lock().await;
+                                                if let Some(sender) = pending.remove(&request_id) {
+                                                    // Send the error response back to the waiting request
+                                                    let _ = sender.send(json_data.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            return Ok(());
+                        }
+                    }
+
+                    // Handle direct POST responses (including errors with "id" field)
+                    if let Some(request_id) = json_data.get("id").and_then(|id| id.as_u64()) {
+                        let mut pending = pending_requests.lock().await;
+                        if let Some(sender) = pending.remove(&(request_id as u32)) {
+                            let _ = sender.send(json_data.clone());
+                            return Ok(());
+                        }
+                    }
+
+                    // Check if this looks like a POST response that we might have missed
+                    if json_data.get("error").is_some() {
+                        log::warn!(
+                            "WebSocket received error response without matching request ID: {}",
+                            data
+                        );
+                        // If we can't match it to a request, just ignore it rather than trying to parse as subscription
+                        return Ok(());
+                    }
+
+                    // Handle normal subscription messages
                     let message = serde_json::from_str::<Message>(&data)
                         .map_err(|e| Error::JsonParse(e.to_string()))?;
                     let identifier = WsManager::get_identifier(&message)?;
@@ -487,6 +569,46 @@ impl WsManager {
             Self::unsubscribe(self.writer.lock().await.borrow_mut(), identifier.as_str()).await?;
         }
         Ok(())
+    }
+
+    pub async fn send_request(
+        &mut self,
+        mut request: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let request_id = self.request_counter.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // Add request ID to the request
+        request["id"] = serde_json::Value::Number(serde_json::Number::from(request_id));
+
+        // Create oneshot channel for response
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        // Store the sender in pending requests
+        {
+            let mut pending = self.pending_requests.lock().await;
+            pending.insert(request_id, tx);
+        }
+
+        // Send the request through WebSocket
+        let request_str =
+            serde_json::to_string(&request).map_err(|e| Error::JsonParse(e.to_string()))?;
+        {
+            let mut writer = self.writer.lock().await;
+            writer
+                .send(tokio_tungstenite::tungstenite::protocol::Message::Text(
+                    request_str,
+                ))
+                .await
+                .map_err(|e| Error::Websocket(e.to_string()))?;
+        }
+
+        // Wait for response with timeout
+        let response = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
+            .await
+            .map_err(|_| Error::RequestTimeout)?
+            .map_err(|_| Error::RequestChannelClosed)?;
+
+        Ok(response)
     }
 }
 

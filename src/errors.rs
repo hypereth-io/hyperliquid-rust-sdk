@@ -61,4 +61,8 @@ pub enum Error {
     SignatureFailure(String),
     #[error("Vault address not found")]
     VaultAddressNotFound,
+    #[error("Request timeout")]
+    RequestTimeout,
+    #[error("Request channel closed")]
+    RequestChannelClosed,
 }

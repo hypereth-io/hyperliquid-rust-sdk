@@ -26,6 +26,7 @@ use crate::{
     prelude::*,
     req::HttpClient,
     signature::{sign_l1_action, sign_typed_data},
+    ws::WsManager,
     BaseUrl, BulkCancelCloid, ClassTransfer, Error, ExchangeResponseStatus, SpotSend, SpotUser,
     VaultTransfer, Withdraw3,
 };
@@ -37,9 +38,11 @@ pub struct ExchangeClient {
     pub meta: Meta,
     pub vault_address: Option<Address>,
     pub coin_to_asset: HashMap<String, u32>,
+    pub(crate) ws_manager: Option<WsManager>,
+    reconnect: bool,
 }
 
-fn serialize_sig<S>(sig: &Signature, s: S) -> std::result::Result<S::Ok, S::Error>
+pub fn serialize_sig<S>(sig: &Signature, s: S) -> std::result::Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -50,14 +53,17 @@ where
     state.end()
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-struct ExchangePayload {
-    action: serde_json::Value,
+pub struct ExchangePayload {
+    pub action: serde_json::Value,
     #[serde(serialize_with = "serialize_sig")]
-    signature: Signature,
-    nonce: u64,
-    vault_address: Option<Address>,
+    pub signature: Signature,
+    pub nonce: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vault_address: Option<Address>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_after: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -84,7 +90,12 @@ pub enum Actions {
 }
 
 impl Actions {
-    fn hash(&self, timestamp: u64, vault_address: Option<Address>) -> Result<B256> {
+    pub fn hash(
+        &self,
+        timestamp: u64,
+        vault_address: Option<Address>,
+        expires_after: Option<u64>,
+    ) -> Result<B256> {
         let mut bytes =
             rmp_serde::to_vec_named(self).map_err(|e| Error::RmpParse(e.to_string()))?;
         bytes.extend(timestamp.to_be_bytes());
@@ -93,6 +104,10 @@ impl Actions {
             bytes.extend(vault_address);
         } else {
             bytes.push(0);
+        }
+        if let Some(expires_after) = expires_after {
+            bytes.push(0);
+            bytes.extend(expires_after.to_be_bytes());
         }
         Ok(keccak256(bytes))
     }
@@ -106,10 +121,32 @@ impl ExchangeClient {
         meta: Option<Meta>,
         vault_address: Option<Address>,
     ) -> Result<ExchangeClient> {
+        Self::new_internal(client, wallet, base_url, meta, vault_address, false).await
+    }
+
+    pub async fn with_reconnect(
+        client: Option<Client>,
+        wallet: PrivateKeySigner,
+        base_url: Option<BaseUrl>,
+        meta: Option<Meta>,
+        vault_address: Option<Address>,
+    ) -> Result<ExchangeClient> {
+        Self::new_internal(client, wallet, base_url, meta, vault_address, true).await
+    }
+
+    async fn new_internal(
+        client: Option<Client>,
+        wallet: PrivateKeySigner,
+        base_url: Option<BaseUrl>,
+        meta: Option<Meta>,
+        vault_address: Option<Address>,
+        reconnect: bool,
+    ) -> Result<ExchangeClient> {
         let client = client.unwrap_or_default();
         let base_url = base_url.unwrap_or(BaseUrl::Mainnet);
 
-        let info = InfoClient::new(None, Some(base_url)).await?;
+        // Pass the client to InfoClient so it uses the same HTTP client with API key headers
+        let info = InfoClient::new(Some(client.clone()), Some(base_url.clone())).await?;
         let meta = if let Some(meta) = meta {
             meta
         } else {
@@ -133,8 +170,11 @@ impl ExchangeClient {
             http_client: HttpClient {
                 client,
                 base_url: base_url.get_url(),
+                base_url_config: base_url,
             },
             coin_to_asset,
+            ws_manager: None,
+            reconnect,
         })
     }
 
@@ -155,6 +195,7 @@ impl ExchangeClient {
             signature,
             nonce,
             vault_address: self.vault_address,
+            expires_after: None,
         };
         let res = serde_json::to_string(&exchange_payload)
             .map_err(|e| Error::JsonParse(e.to_string()))?;
@@ -179,7 +220,7 @@ impl ExchangeClient {
         let timestamp = next_nonce();
 
         let action = Actions::EvmUserModify(EvmUserModify { using_big_blocks });
-        let connection_id = action.hash(timestamp, self.vault_address)?;
+        let connection_id = action.hash(timestamp, self.vault_address, None)?;
         let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
         let is_mainnet = self.http_client.is_mainnet();
         let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
@@ -230,7 +271,7 @@ impl ExchangeClient {
         let action = Actions::SpotUser(SpotUser {
             class_transfer: ClassTransfer { usdc, to_perp },
         });
-        let connection_id = action.hash(timestamp, self.vault_address)?;
+        let connection_id = action.hash(timestamp, self.vault_address, None)?;
         let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
         let is_mainnet = self.http_client.is_mainnet();
         let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
@@ -258,7 +299,7 @@ impl ExchangeClient {
             is_deposit,
             usd,
         });
-        let connection_id = action.hash(timestamp, self.vault_address)?;
+        let connection_id = action.hash(timestamp, self.vault_address, None)?;
         let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
         let is_mainnet = self.http_client.is_mainnet();
         let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
@@ -455,7 +496,7 @@ impl ExchangeClient {
             grouping: "na".to_string(),
             builder: None,
         });
-        let connection_id = action.hash(timestamp, self.vault_address)?;
+        let connection_id = action.hash(timestamp, self.vault_address, None)?;
         let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
 
         let is_mainnet = self.http_client.is_mainnet();
@@ -485,7 +526,7 @@ impl ExchangeClient {
             grouping: "na".to_string(),
             builder: Some(builder),
         });
-        let connection_id = action.hash(timestamp, self.vault_address)?;
+        let connection_id = action.hash(timestamp, self.vault_address, None)?;
         let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
 
         let is_mainnet = self.http_client.is_mainnet();
@@ -524,7 +565,7 @@ impl ExchangeClient {
         let action = Actions::Cancel(BulkCancel {
             cancels: transformed_cancels,
         });
-        let connection_id = action.hash(timestamp, self.vault_address)?;
+        let connection_id = action.hash(timestamp, self.vault_address, None)?;
 
         let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
         let is_mainnet = self.http_client.is_mainnet();
@@ -560,7 +601,7 @@ impl ExchangeClient {
         let action = Actions::BatchModify(BulkModify {
             modifies: transformed_modifies,
         });
-        let connection_id = action.hash(timestamp, self.vault_address)?;
+        let connection_id = action.hash(timestamp, self.vault_address, None)?;
 
         let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
         let is_mainnet = self.http_client.is_mainnet();
@@ -601,7 +642,7 @@ impl ExchangeClient {
             cancels: transformed_cancels,
         });
 
-        let connection_id = action.hash(timestamp, self.vault_address)?;
+        let connection_id = action.hash(timestamp, self.vault_address, None)?;
         let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
         let is_mainnet = self.http_client.is_mainnet();
         let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
@@ -626,7 +667,7 @@ impl ExchangeClient {
             is_cross,
             leverage,
         });
-        let connection_id = action.hash(timestamp, self.vault_address)?;
+        let connection_id = action.hash(timestamp, self.vault_address, None)?;
         let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
         let is_mainnet = self.http_client.is_mainnet();
         let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
@@ -651,7 +692,7 @@ impl ExchangeClient {
             is_buy: true,
             ntli: amount,
         });
-        let connection_id = action.hash(timestamp, self.vault_address)?;
+        let connection_id = action.hash(timestamp, self.vault_address, None)?;
         let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
         let is_mainnet = self.http_client.is_mainnet();
         let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
@@ -754,7 +795,7 @@ impl ExchangeClient {
 
         let action = Actions::SetReferrer(SetReferrer { code });
 
-        let connection_id = action.hash(timestamp, self.vault_address)?;
+        let connection_id = action.hash(timestamp, self.vault_address, None)?;
         let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
 
         let is_mainnet = self.http_client.is_mainnet();
@@ -800,7 +841,7 @@ impl ExchangeClient {
         let timestamp = next_nonce();
 
         let action = Actions::ScheduleCancel(ScheduleCancel { time });
-        let connection_id = action.hash(timestamp, self.vault_address)?;
+        let connection_id = action.hash(timestamp, self.vault_address, None)?;
         let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
         let is_mainnet = self.http_client.is_mainnet();
         let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
@@ -816,12 +857,82 @@ impl ExchangeClient {
         let timestamp = next_nonce();
 
         let action = Actions::ClaimRewards(ClaimRewards {});
-        let connection_id = action.hash(timestamp, self.vault_address)?;
+        let connection_id = action.hash(timestamp, self.vault_address, None)?;
         let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
         let is_mainnet = self.http_client.is_mainnet();
         let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
 
         self.post(action, signature, timestamp).await
+    }
+
+    pub async fn send_ws_request(
+        &mut self,
+        action: serde_json::Value,
+        signature: Signature,
+        nonce: u64,
+    ) -> Result<ExchangeResponseStatus> {
+        if self.ws_manager.is_none() {
+            let ws_url = format!("ws{}/ws", &self.http_client.base_url[4..]);
+            let ws_manager = WsManager::new(ws_url, self.reconnect).await?;
+            self.ws_manager = Some(ws_manager);
+        }
+
+        let exchange_payload = ExchangePayload {
+            action,
+            signature,
+            nonce,
+            vault_address: self.vault_address,
+            expires_after: None,
+        };
+
+        let request = serde_json::json!({
+            "method": "post",
+            "request": {
+                "type": "action",
+                "payload": {
+                    "action": exchange_payload.action,
+                    "nonce": exchange_payload.nonce,
+                    "signature": {
+                        "r": format!("0x{:x}", signature.r()),
+                        "s": format!("0x{:x}", signature.s()),
+                        "v": 27 + signature.v() as u64
+                    },
+                    "vaultAddress": exchange_payload.vault_address,
+                    "expiresAfter": null
+                }
+            }
+        });
+
+        // Debug: Log the complete WebSocket request JSON
+        log::debug!(
+            "WebSocket request JSON: {}",
+            serde_json::to_string_pretty(&request).unwrap_or_default()
+        );
+
+        let response = self
+            .ws_manager
+            .as_mut()
+            .ok_or(Error::WsManagerNotFound)?
+            .send_request(request)
+            .await?;
+
+        // Debug: Log the WebSocket response to understand its structure
+        log::debug!("WebSocket response: {}", response);
+
+        // WebSocket responses have structure: { "id": ..., "response": { "type": "action", "payload": {...} } }
+        // Extract the payload from response.payload
+        if let Some(ws_response) = response.get("response") {
+            if let Some(payload) = ws_response.get("payload") {
+                serde_json::from_value(payload.clone()).map_err(|e| Error::JsonParse(e.to_string()))
+            } else {
+                // If no payload, try to parse the whole ws_response
+                serde_json::from_value(ws_response.clone())
+                    .map_err(|e| Error::JsonParse(e.to_string()))
+            }
+        } else {
+            // Fallback: try to parse the whole response
+            serde_json::from_value(response).map_err(|e| Error::JsonParse(e.to_string()))
+        }
     }
 }
 
