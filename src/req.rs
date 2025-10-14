@@ -14,6 +14,7 @@ struct ErrorData {
 pub struct HttpClient {
     pub client: Client,
     pub base_url: String,
+    pub base_url_config: BaseUrl,
 }
 
 async fn parse_response(response: Response) -> Result<String> {
@@ -53,23 +54,28 @@ async fn parse_response(response: Response) -> Result<String> {
 
 impl HttpClient {
     pub async fn post(&self, url_path: &'static str, data: String) -> Result<String> {
-        let full_url = format!("{}{url_path}", self.base_url);
-        let request = self
+        let full_url = if let Some(query_pos) = self.base_url.find('?') {
+            // Split URL and query parameters, insert path before query
+            let base_part = &self.base_url[..query_pos];
+            let query_part = &self.base_url[query_pos..];
+            format!("{}{}{}", base_part, url_path, query_part)
+        } else {
+            format!("{}{}", self.base_url, url_path)
+        };
+
+        // Don't build() the request separately - send it directly to preserve default headers
+        let result = self
             .client
             .post(full_url)
             .header("Content-Type", "application/json")
             .body(data)
-            .build()
-            .map_err(|e| Error::GenericRequest(e.to_string()))?;
-        let result = self
-            .client
-            .execute(request)
+            .send()
             .await
             .map_err(|e| Error::GenericRequest(e.to_string()))?;
         parse_response(result).await
     }
 
     pub fn is_mainnet(&self) -> bool {
-        self.base_url == BaseUrl::Mainnet.get_url()
+        self.base_url_config.is_mainnet()
     }
 }

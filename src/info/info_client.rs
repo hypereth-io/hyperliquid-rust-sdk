@@ -7,8 +7,9 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
     info::{
-        CandlesSnapshotResponse, FundingHistoryResponse, L2SnapshotResponse, OpenOrdersResponse,
-        OrderInfo, RecentTradesResponse, UserFillsResponse, UserStateResponse, ActiveAssetDataResponse,
+        ActiveAssetDataResponse, CandlesSnapshotResponse, FundingHistoryResponse,
+        L2SnapshotResponse, OpenOrdersResponse, OrderInfo, RecentTradesResponse, UserFillsResponse,
+        UserStateResponse,
     },
     meta::{AssetContext, Meta, SpotMeta, SpotMetaAndAssetCtxs},
     prelude::*,
@@ -100,32 +101,61 @@ pub struct InfoClient {
     pub http_client: HttpClient,
     pub(crate) ws_manager: Option<WsManager>,
     reconnect: bool,
+    api_key: Option<String>,
 }
 
 impl InfoClient {
     pub async fn new(client: Option<Client>, base_url: Option<BaseUrl>) -> Result<InfoClient> {
-        Self::new_internal(client, base_url, false).await
+        Self::new_internal(client, base_url, false, None).await
+    }
+
+    /// Create a new InfoClient with an API key
+    /// The API key will be added as the x-api-key header to all requests (including WebSocket)
+    pub async fn new_with_api_key(
+        api_key: String,
+        base_url: Option<BaseUrl>,
+    ) -> Result<InfoClient> {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-api-key",
+            HeaderValue::from_str(&api_key)
+                .map_err(|e| Error::GenericRequest(format!("Invalid API key: {}", e)))?,
+        );
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .map_err(|e| Error::GenericRequest(format!("Failed to create HTTP client: {}", e)))?;
+
+        Self::new_internal(Some(client), base_url, false, Some(api_key)).await
     }
 
     pub async fn with_reconnect(
         client: Option<Client>,
         base_url: Option<BaseUrl>,
     ) -> Result<InfoClient> {
-        Self::new_internal(client, base_url, true).await
+        Self::new_internal(client, base_url, true, None).await
     }
 
     async fn new_internal(
         client: Option<Client>,
         base_url: Option<BaseUrl>,
         reconnect: bool,
+        api_key: Option<String>,
     ) -> Result<InfoClient> {
         let client = client.unwrap_or_default();
-        let base_url = base_url.unwrap_or(BaseUrl::Mainnet).get_url();
+        let base_url_config = base_url.unwrap_or(BaseUrl::Mainnet);
+        let base_url = base_url_config.get_url();
 
         Ok(InfoClient {
-            http_client: HttpClient { client, base_url },
+            http_client: HttpClient {
+                client,
+                base_url,
+                base_url_config,
+            },
             ws_manager: None,
             reconnect,
+            api_key,
         })
     }
 
@@ -135,11 +165,22 @@ impl InfoClient {
         sender_channel: UnboundedSender<Message>,
     ) -> Result<u32> {
         if self.ws_manager.is_none() {
-            let ws_manager = WsManager::new(
-                format!("ws{}/ws", &self.http_client.base_url[4..]),
-                self.reconnect,
-            )
-            .await?;
+            let ws_url = if let Some(query_pos) = self.http_client.base_url.find('?') {
+                // Split URL and query parameters
+                let base_part = &self.http_client.base_url[..query_pos];
+                let query_part = &self.http_client.base_url[query_pos..];
+                format!("ws{}/ws{}", &base_part[4..], query_part)
+            } else {
+                format!("ws{}/ws", &self.http_client.base_url[4..])
+            };
+
+            // Create WebSocket with API key header if available
+            let ws_manager = if let Some(api_key) = &self.api_key {
+                let headers = vec![("x-api-key".to_string(), api_key.clone())];
+                WsManager::new_with_headers(ws_url, self.reconnect, Some(headers)).await?
+            } else {
+                WsManager::new(ws_url, self.reconnect).await?
+            };
             self.ws_manager = Some(ws_manager);
         }
 
@@ -155,11 +196,15 @@ impl InfoClient {
 
     pub async fn unsubscribe(&mut self, subscription_id: u32) -> Result<()> {
         if self.ws_manager.is_none() {
-            let ws_manager = WsManager::new(
-                format!("ws{}/ws", &self.http_client.base_url[4..]),
-                self.reconnect,
-            )
-            .await?;
+            let ws_url = if let Some(query_pos) = self.http_client.base_url.find('?') {
+                // Split URL and query parameters
+                let base_part = &self.http_client.base_url[..query_pos];
+                let query_part = &self.http_client.base_url[query_pos..];
+                format!("ws{}/ws{}", &base_part[4..], query_part)
+            } else {
+                format!("ws{}/ws", &self.http_client.base_url[4..])
+            };
+            let ws_manager = WsManager::new(ws_url, self.reconnect).await?;
             self.ws_manager = Some(ws_manager);
         }
 
@@ -292,6 +337,62 @@ impl InfoClient {
         self.send_info_request(input).await
     }
 
+    pub async fn candles_snapshot_ws(
+        &mut self,
+        coin: String,
+        interval: String,
+        start_time: u64,
+        end_time: u64,
+    ) -> Result<serde_json::Value> {
+        // Ensure WebSocket manager exists
+        if self.ws_manager.is_none() {
+            let ws_url = if let Some(query_pos) = self.http_client.base_url.find('?') {
+                // Split URL and query parameters
+                let base_part = &self.http_client.base_url[..query_pos];
+                let query_part = &self.http_client.base_url[query_pos..];
+                format!("ws{}/ws{}", &base_part[4..], query_part)
+            } else {
+                format!("ws{}/ws", &self.http_client.base_url[4..])
+            };
+
+            // Create WebSocket with API key header if available
+            let ws_manager = if let Some(api_key) = &self.api_key {
+                let headers = vec![("x-api-key".to_string(), api_key.clone())];
+                WsManager::new_with_headers(ws_url, self.reconnect, Some(headers)).await?
+            } else {
+                WsManager::new(ws_url, self.reconnect).await?
+            };
+            self.ws_manager = Some(ws_manager);
+        }
+
+        // Create WebSocket POST request for candle snapshot
+        let request = serde_json::json!({
+            "method": "post",
+            "request": {
+                "type": "info",
+                "payload": {
+                    "type": "candleSnapshot",
+                    "req": {
+                        "coin": coin,
+                        "interval": interval,
+                        "startTime": start_time,
+                        "endTime": end_time
+                    }
+                }
+            }
+        });
+
+        // Send via WebSocket
+        let response = self
+            .ws_manager
+            .as_mut()
+            .ok_or(Error::WsManagerNotFound)?
+            .send_request(request)
+            .await?;
+
+        Ok(response)
+    }
+
     pub async fn query_order_by_oid(
         &self,
         address: Address,
@@ -311,7 +412,11 @@ impl InfoClient {
         self.send_info_request(input).await
     }
 
-    pub async fn active_asset_data(&self, user: Address, coin: String) -> Result<ActiveAssetDataResponse> {
+    pub async fn active_asset_data(
+        &self,
+        user: Address,
+        coin: String,
+    ) -> Result<ActiveAssetDataResponse> {
         let input = InfoRequest::ActiveAssetData { user, coin };
         self.send_info_request(input).await
     }

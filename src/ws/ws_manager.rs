@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     ops::DerefMut,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
     },
     time::Duration,
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     net::TcpStream,
     spawn,
-    sync::{mpsc::UnboundedSender, Mutex},
+    sync::{mpsc::UnboundedSender, oneshot, Mutex},
     time,
 };
 use tokio_tungstenite::{
@@ -42,12 +42,18 @@ struct SubscriptionData {
     id: String,
 }
 #[derive(Debug)]
-pub(crate) struct WsManager {
+pub struct WsManager {
     stop_flag: Arc<AtomicBool>,
     writer: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, protocol::Message>>>,
     subscriptions: Arc<Mutex<HashMap<String, Vec<SubscriptionData>>>>,
     subscription_id: u32,
     subscription_identifiers: HashMap<u32, String>,
+    // Request/response tracking
+    request_counter: Arc<AtomicU32>,
+    pending_requests: Arc<Mutex<HashMap<u32, oneshot::Sender<serde_json::Value>>>>,
+    // Store headers for reconnection
+    #[allow(dead_code)] // Used in reconnection logic via clone
+    headers: Option<Vec<(String, String)>>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -109,24 +115,40 @@ pub(crate) struct Ping {
 impl WsManager {
     const SEND_PING_INTERVAL: u64 = 50;
 
-    pub(crate) async fn new(url: String, reconnect: bool) -> Result<WsManager> {
+    pub async fn new(url: String, reconnect: bool) -> Result<WsManager> {
+        Self::new_with_headers(url, reconnect, None).await
+    }
+
+    pub async fn new_with_headers(
+        url: String,
+        reconnect: bool,
+        headers: Option<Vec<(String, String)>>,
+    ) -> Result<WsManager> {
         let stop_flag = Arc::new(AtomicBool::new(false));
 
-        let (writer, mut reader) = Self::connect(&url).await?.split();
+        let (writer, mut reader) = Self::connect(&url, headers.clone()).await?.split();
         let writer = Arc::new(Mutex::new(writer));
 
         let subscriptions_map: HashMap<String, Vec<SubscriptionData>> = HashMap::new();
         let subscriptions = Arc::new(Mutex::new(subscriptions_map));
         let subscriptions_copy = Arc::clone(&subscriptions);
 
+        let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+        let pending_requests_copy = Arc::clone(&pending_requests);
+
         {
             let writer = writer.clone();
             let stop_flag = Arc::clone(&stop_flag);
+            let headers_clone = headers.clone();
             let reader_fut = async move {
                 while !stop_flag.load(Ordering::Relaxed) {
                     if let Some(data) = reader.next().await {
-                        if let Err(err) =
-                            WsManager::parse_and_send_data(data, &subscriptions_copy).await
+                        if let Err(err) = WsManager::parse_and_send_data(
+                            data,
+                            &subscriptions_copy,
+                            &pending_requests_copy,
+                        )
+                        .await
                         {
                             error!("Error processing data received by WsManager reader: {err}");
                         }
@@ -144,7 +166,7 @@ impl WsManager {
                             // Always sleep for 1 second before attempting to reconnect so it does not spin during reconnecting. This could be enhanced with exponential backoff.
                             tokio::time::sleep(Duration::from_secs(1)).await;
                             info!("WsManager attempting to reconnect");
-                            match Self::connect(&url).await {
+                            match Self::connect(&url, headers_clone.clone()).await {
                                 Ok(ws) => {
                                     let (new_writer, new_reader) = ws.split();
                                     reader = new_reader;
@@ -216,11 +238,46 @@ impl WsManager {
             subscriptions,
             subscription_id: 0,
             subscription_identifiers: HashMap::new(),
+            request_counter: Arc::new(AtomicU32::new(0)),
+            pending_requests,
+            headers,
         })
     }
 
-    async fn connect(url: &str) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-        Ok(connect_async(url)
+    async fn connect(
+        url: &str,
+        headers: Option<Vec<(String, String)>>,
+    ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        // If no headers, use simple connect
+        if headers.is_none() {
+            return Ok(connect_async(url)
+                .await
+                .map_err(|e| Error::Websocket(e.to_string()))?
+                .0);
+        }
+
+        // Create request with headers
+        let mut request = url
+            .into_client_request()
+            .map_err(|e| Error::Websocket(e.to_string()))?;
+
+        // Add custom headers if provided
+        if let Some(headers_vec) = headers {
+            let request_headers = request.headers_mut();
+            for (key, value) in headers_vec {
+                use tokio_tungstenite::tungstenite::http::HeaderValue;
+                if let Ok(header_value) = HeaderValue::from_str(&value) {
+                    let header_name = key
+                        .parse::<tokio_tungstenite::tungstenite::http::HeaderName>()
+                        .map_err(|e| Error::Websocket(e.to_string()))?;
+                    request_headers.insert(header_name, header_value);
+                }
+            }
+        }
+
+        Ok(connect_async(request)
             .await
             .map_err(|e| Error::Websocket(e.to_string()))?
             .0)
@@ -302,6 +359,9 @@ impl WsManager {
     async fn parse_and_send_data(
         data: std::result::Result<protocol::Message, tungstenite::Error>,
         subscriptions: &Arc<Mutex<HashMap<String, Vec<SubscriptionData>>>>,
+        pending_requests: &Arc<
+            Mutex<HashMap<u32, tokio::sync::oneshot::Sender<serde_json::Value>>>,
+        >,
     ) -> Result<()> {
         match data {
             Ok(data) => match data.into_text() {
@@ -309,6 +369,73 @@ impl WsManager {
                     if !data.starts_with('{') {
                         return Ok(());
                     }
+
+                    // Try to parse as general JSON first to check for POST responses
+                    let json_data: serde_json::Value =
+                        serde_json::from_str(&data).map_err(|e| Error::JsonParse(e.to_string()))?;
+
+                    // Handle POST method responses (success and error cases)
+                    if let Some(channel) = json_data.get("channel") {
+                        if channel == "post" {
+                            if let Some(response_data) = json_data.get("data") {
+                                if let Some(request_id) =
+                                    response_data.get("id").and_then(|id| id.as_u64())
+                                {
+                                    let mut pending = pending_requests.lock().await;
+                                    if let Some(sender) = pending.remove(&(request_id as u32)) {
+                                        let _ = sender.send(response_data.clone());
+                                    }
+                                }
+                            }
+                            return Ok(());
+                        } else if channel == "error" {
+                            // Handle error responses - try to extract request ID from the error data
+                            if let Some(error_msg) = json_data.get("data").and_then(|d| d.as_str())
+                            {
+                                log::warn!("WebSocket POST error: {}", error_msg);
+                                // Try to extract request ID from the error message
+                                // The error message contains the original request as JSON
+                                if error_msg.contains("\"id\":") {
+                                    // Use regex or string parsing to find the request ID
+                                    if let Some(id_start) = error_msg.find("\"id\":") {
+                                        let id_substr = &error_msg[id_start + 5..];
+                                        if let Some(comma_pos) = id_substr.find(',') {
+                                            let id_str = &id_substr[..comma_pos];
+                                            if let Ok(request_id) = id_str.parse::<u32>() {
+                                                let mut pending = pending_requests.lock().await;
+                                                if let Some(sender) = pending.remove(&request_id) {
+                                                    // Send the error response back to the waiting request
+                                                    let _ = sender.send(json_data.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            return Ok(());
+                        }
+                    }
+
+                    // Handle direct POST responses (including errors with "id" field)
+                    if let Some(request_id) = json_data.get("id").and_then(|id| id.as_u64()) {
+                        let mut pending = pending_requests.lock().await;
+                        if let Some(sender) = pending.remove(&(request_id as u32)) {
+                            let _ = sender.send(json_data.clone());
+                            return Ok(());
+                        }
+                    }
+
+                    // Check if this looks like a POST response that we might have missed
+                    if json_data.get("error").is_some() {
+                        log::warn!(
+                            "WebSocket received error response without matching request ID: {}",
+                            data
+                        );
+                        // If we can't match it to a request, just ignore it rather than trying to parse as subscription
+                        return Ok(());
+                    }
+
+                    // Handle normal subscription messages
                     let message = serde_json::from_str::<Message>(&data)
                         .map_err(|e| Error::JsonParse(e.to_string()))?;
                     let identifier = WsManager::get_identifier(&message)?;
@@ -487,6 +614,46 @@ impl WsManager {
             Self::unsubscribe(self.writer.lock().await.borrow_mut(), identifier.as_str()).await?;
         }
         Ok(())
+    }
+
+    pub async fn send_request(
+        &mut self,
+        mut request: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let request_id = self.request_counter.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // Add request ID to the request
+        request["id"] = serde_json::Value::Number(serde_json::Number::from(request_id));
+
+        // Create oneshot channel for response
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        // Store the sender in pending requests
+        {
+            let mut pending = self.pending_requests.lock().await;
+            pending.insert(request_id, tx);
+        }
+
+        // Send the request through WebSocket
+        let request_str =
+            serde_json::to_string(&request).map_err(|e| Error::JsonParse(e.to_string()))?;
+        {
+            let mut writer = self.writer.lock().await;
+            writer
+                .send(tokio_tungstenite::tungstenite::protocol::Message::Text(
+                    request_str,
+                ))
+                .await
+                .map_err(|e| Error::Websocket(e.to_string()))?;
+        }
+
+        // Wait for response with timeout
+        let response = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
+            .await
+            .map_err(|_| Error::RequestTimeout)?
+            .map_err(|_| Error::RequestChannelClosed)?;
+
+        Ok(response)
     }
 }
 
