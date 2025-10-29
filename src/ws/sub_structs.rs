@@ -54,7 +54,6 @@ pub struct TradeInfo {
     pub fee: String,
     pub fee_token: String,
     pub tid: u64,
-    // TODO: verify this.
     // From: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions
     pub liquidation: Option<FillLiquidation>,
 }
