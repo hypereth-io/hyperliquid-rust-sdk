@@ -8,7 +8,7 @@ mod order;
 
 pub use actions::*;
 pub use builder::*;
-pub use cancel::{CancelRequest, ClientCancelRequest, ClientCancelRequestCloid};
+pub use cancel::*;
 pub use exchange_client::*;
 pub use exchange_responses::*;
 pub use modify::{ClientModifyRequest, ModifyRequest};
