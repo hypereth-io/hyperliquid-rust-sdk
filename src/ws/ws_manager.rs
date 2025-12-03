@@ -99,14 +99,14 @@ pub enum Message {
 }
 
 #[derive(Serialize)]
-pub(crate) struct SubscriptionSendData<'a> {
-    method: &'static str,
-    subscription: &'a serde_json::Value,
+pub struct SubscriptionSendData<'a> {
+    pub method: &'static str,
+    pub subscription: &'a serde_json::Value,
 }
 
 #[derive(Serialize)]
-pub(crate) struct Ping {
-    method: &'static str,
+pub struct Ping {
+    pub method: &'static str,
 }
 
 impl WsManager {
