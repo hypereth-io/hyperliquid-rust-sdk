@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, future::Future, pin::Pin, time::Duration};
 
 use alloy::primitives::Address;
+use futures_util::future::select_all;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
@@ -18,6 +19,24 @@ use crate::{
     BaseUrl, Error, Message, OrderStatusResponse, ReferralResponse, UserFeesResponse,
     UserFundingResponse, UserTokenBalanceResponse,
 };
+
+/// Custom endpoint configuration for racing requests
+#[derive(Debug, Clone)]
+pub struct Endpoint {
+    /// Short name for identifying this endpoint (e.g., "local-1", "us-west")
+    pub name: String,
+    /// The URL of the endpoint
+    pub url: String,
+}
+
+impl Endpoint {
+    pub fn new(name: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            url: url.into(),
+        }
+    }
+}
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -96,33 +115,83 @@ pub enum InfoRequest {
     },
 }
 
+impl InfoRequest {
+    /// Check if this request type supports parallel querying across multiple endpoints
+    fn supports_parallel_query(&self) -> bool {
+        matches!(
+            self,
+            InfoRequest::UserState { .. }    // clearinghouseState
+            | InfoRequest::Meta              // meta
+            | InfoRequest::OpenOrders { .. } // openOrders
+        )
+    }
+}
+
 #[derive(Debug)]
 pub struct InfoClient {
     pub http_client: HttpClient,
     pub(crate) ws_manager: Option<WsManager>,
     reconnect: bool,
+    /// Custom endpoints for racing requests (each with 2s timeout)
+    custom_endpoints: Vec<(Endpoint, Client)>,
 }
 
 impl InfoClient {
+    /// Create a new InfoClient with only the official endpoint.
     pub async fn new(client: Option<Client>, base_url: Option<BaseUrl>) -> Result<InfoClient> {
-        Self::new_internal(client, base_url, false).await
+        Self::new_internal(client, base_url, false, Vec::new()).await
     }
 
+    /// Create a new InfoClient with WebSocket reconnect enabled.
     pub async fn with_reconnect(
         client: Option<Client>,
         base_url: Option<BaseUrl>,
     ) -> Result<InfoClient> {
-        Self::new_internal(client, base_url, true).await
+        Self::new_internal(client, base_url, true, Vec::new()).await
+    }
+
+    /// Create a new InfoClient with custom endpoints for racing.
+    /// For eligible requests (UserState, Meta, OpenOrders), all custom endpoints
+    /// plus the official endpoint will be queried simultaneously, returning the
+    /// first successful response.
+    pub async fn with_endpoints(
+        client: Option<Client>,
+        base_url: Option<BaseUrl>,
+        endpoints: Vec<Endpoint>,
+    ) -> Result<InfoClient> {
+        Self::new_internal(client, base_url, false, endpoints).await
+    }
+
+    /// Create a new InfoClient with WebSocket reconnect and custom endpoints for racing.
+    pub async fn with_reconnect_and_endpoints(
+        client: Option<Client>,
+        base_url: Option<BaseUrl>,
+        endpoints: Vec<Endpoint>,
+    ) -> Result<InfoClient> {
+        Self::new_internal(client, base_url, true, endpoints).await
     }
 
     async fn new_internal(
         client: Option<Client>,
         base_url: Option<BaseUrl>,
         reconnect: bool,
+        endpoints: Vec<Endpoint>,
     ) -> Result<InfoClient> {
         let client = client.unwrap_or_default();
         let base_url_config = base_url.unwrap_or(BaseUrl::Mainnet);
         let base_url = base_url_config.get_url();
+
+        // Create a client with 2s timeout for each custom endpoint
+        let custom_endpoints: Vec<(Endpoint, Client)> = endpoints
+            .into_iter()
+            .map(|endpoint| {
+                let client = Client::builder()
+                    .timeout(Duration::from_secs(2))
+                    .build()
+                    .unwrap_or_default();
+                (endpoint, client)
+            })
+            .collect();
 
         Ok(InfoClient {
             http_client: HttpClient {
@@ -132,6 +201,7 @@ impl InfoClient {
             },
             ws_manager: None,
             reconnect,
+            custom_endpoints,
         })
     }
 
@@ -178,8 +248,109 @@ impl InfoClient {
         let data =
             serde_json::to_string(&info_request).map_err(|e| Error::JsonParse(e.to_string()))?;
 
+        // If request supports parallel query and we have custom endpoints, query all in parallel
+        if info_request.supports_parallel_query() && !self.custom_endpoints.is_empty() {
+            return self.query_parallel(&data).await;
+        }
+
+        // Official endpoint only (default path)
         let return_data = self.http_client.post("/info", data).await?;
         serde_json::from_str(&return_data).map_err(|e| Error::JsonParse(e.to_string()))
+    }
+
+    /// Query all endpoints (custom + official) in parallel and return the first successful response
+    async fn query_parallel<T: for<'a> Deserialize<'a>>(&self, data: &str) -> Result<T> {
+        type RaceResult = std::result::Result<(String, String), (String, String)>;
+        type RaceFuture = Pin<Box<dyn Future<Output = RaceResult> + Send>>;
+
+        let mut futures: Vec<RaceFuture> = Vec::new();
+
+        // Add futures for custom endpoints (2s timeout each)
+        for (endpoint, client) in &self.custom_endpoints {
+            let url = format!("{}/info", endpoint.url.trim_end_matches('/'));
+            let name = endpoint.name.clone();
+            let data = data.to_string();
+            let client = client.clone();
+
+            futures.push(Box::pin(async move {
+                match client
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .body(data)
+                    .send()
+                    .await
+                {
+                    Ok(response) => {
+                        if response.status().is_success() {
+                            match response.text().await {
+                                Ok(text) => Ok((name, text)),
+                                Err(e) => Err((name, format!("Response read failed: {e}"))),
+                            }
+                        } else {
+                            Err((name, format!("HTTP status: {}", response.status())))
+                        }
+                    }
+                    Err(e) => Err((name, format!("Request failed: {e}"))),
+                }
+            }));
+        }
+
+        // Add future for official endpoint (no timeout)
+        let official_client = self.http_client.client.clone();
+        let official_url = format!("{}/info", self.http_client.base_url);
+        let official_data = data.to_string();
+
+        futures.push(Box::pin(async move {
+            match official_client
+                .post(&official_url)
+                .header("Content-Type", "application/json")
+                .body(official_data)
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        match response.text().await {
+                            Ok(text) => Ok(("official".to_string(), text)),
+                            Err(e) => Err(("official".to_string(), format!("Response read failed: {e}"))),
+                        }
+                    } else {
+                        Err(("official".to_string(), format!("HTTP status: {}", response.status())))
+                    }
+                }
+                Err(e) => Err(("official".to_string(), format!("Request failed: {e}"))),
+            }
+        }));
+
+        // Collect errors as we race
+        let mut errors: Vec<(String, String)> = Vec::new();
+
+        // Race until we get a success or all fail
+        while !futures.is_empty() {
+            let (result, _index, remaining) = select_all(futures).await;
+            futures = remaining;
+
+            match result {
+                Ok((name, response_text)) => {
+                    log::info!("Endpoint '{}' responded first", name);
+                    return serde_json::from_str(&response_text)
+                        .map_err(|e| Error::JsonParse(e.to_string()));
+                }
+                Err((name, error)) => {
+                    log::warn!("Endpoint '{}' failed: {}", name, error);
+                    errors.push((name, error));
+                }
+            }
+        }
+
+        // All endpoints failed - aggregate errors
+        let error_msg = errors
+            .iter()
+            .map(|(name, err)| format!("{}: {}", name, err))
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        Err(Error::AllEndpointsFailed(error_msg))
     }
 
     pub async fn open_orders(&self, address: Address) -> Result<Vec<OpenOrdersResponse>> {

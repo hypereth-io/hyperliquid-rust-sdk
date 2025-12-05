@@ -65,4 +65,6 @@ pub enum Error {
     RequestTimeout,
     #[error("Request channel closed")]
     RequestChannelClosed,
+    #[error("All endpoints failed: {0}")]
+    AllEndpointsFailed(String),
 }
