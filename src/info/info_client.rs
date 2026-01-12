@@ -73,7 +73,10 @@ pub enum InfoRequest {
         user: Address,
         oid: u64,
     },
-    Meta,
+    Meta {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        dex: String,
+    },
     MetaAndAssetCtxs,
     SpotMeta,
     SpotMetaAndAssetCtxs,
@@ -121,7 +124,7 @@ impl InfoRequest {
         matches!(
             self,
             InfoRequest::UserState { .. }    // clearinghouseState
-            | InfoRequest::Meta              // meta
+            | InfoRequest::Meta { .. }       // meta
             | InfoRequest::OpenOrders { .. } // openOrders
         )
     }
@@ -379,7 +382,16 @@ impl InfoClient {
     }
 
     pub async fn meta(&self) -> Result<Meta> {
-        let input = InfoRequest::Meta;
+        let input = InfoRequest::Meta {
+            dex: String::new(),
+        };
+        self.send_info_request(input).await
+    }
+
+    pub async fn meta_with_dex(&self, dex: &str) -> Result<Meta> {
+        let input = InfoRequest::Meta {
+            dex: dex.to_string(),
+        };
         self.send_info_request(input).await
     }
 
