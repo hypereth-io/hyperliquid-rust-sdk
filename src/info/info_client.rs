@@ -54,6 +54,8 @@ pub enum InfoRequest {
     #[serde(rename = "clearinghouseState")]
     UserState {
         user: Address,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        dex: String,
     },
     #[serde(rename = "batchClearinghouseStates")]
     UserStates {
@@ -362,7 +364,22 @@ impl InfoClient {
     }
 
     pub async fn user_state(&self, address: Address) -> Result<UserStateResponse> {
-        let input = InfoRequest::UserState { user: address };
+        let input = InfoRequest::UserState {
+            user: address,
+            dex: String::new(),
+        };
+        self.send_info_request(input).await
+    }
+
+    pub async fn user_state_with_dex(
+        &self,
+        address: Address,
+        dex: &str,
+    ) -> Result<UserStateResponse> {
+        let input = InfoRequest::UserState {
+            user: address,
+            dex: dex.to_string(),
+        };
         self.send_info_request(input).await
     }
 
