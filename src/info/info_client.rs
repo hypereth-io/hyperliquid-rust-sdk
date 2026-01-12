@@ -79,7 +79,10 @@ pub enum InfoRequest {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         dex: String,
     },
-    MetaAndAssetCtxs,
+    MetaAndAssetCtxs {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        dex: String,
+    },
     SpotMeta,
     SpotMetaAndAssetCtxs,
     AllMids,
@@ -413,7 +416,19 @@ impl InfoClient {
     }
 
     pub async fn meta_and_asset_contexts(&self) -> Result<(Meta, Vec<AssetContext>)> {
-        let input = InfoRequest::MetaAndAssetCtxs;
+        let input = InfoRequest::MetaAndAssetCtxs {
+            dex: String::new(),
+        };
+        self.send_info_request(input).await
+    }
+
+    pub async fn meta_and_asset_contexts_with_dex(
+        &self,
+        dex: &str,
+    ) -> Result<(Meta, Vec<AssetContext>)> {
+        let input = InfoRequest::MetaAndAssetCtxs {
+            dex: dex.to_string(),
+        };
         self.send_info_request(input).await
     }
 
