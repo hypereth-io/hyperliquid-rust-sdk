@@ -70,6 +70,8 @@ pub enum InfoRequest {
     },
     OpenOrders {
         user: Address,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        dex: String,
     },
     OrderStatus {
         user: Address,
@@ -363,7 +365,22 @@ impl InfoClient {
     }
 
     pub async fn open_orders(&self, address: Address) -> Result<Vec<OpenOrdersResponse>> {
-        let input = InfoRequest::OpenOrders { user: address };
+        let input = InfoRequest::OpenOrders {
+            user: address,
+            dex: String::new(),
+        };
+        self.send_info_request(input).await
+    }
+
+    pub async fn open_orders_with_dex(
+        &self,
+        address: Address,
+        dex: &str,
+    ) -> Result<Vec<OpenOrdersResponse>> {
+        let input = InfoRequest::OpenOrders {
+            user: address,
+            dex: dex.to_string(),
+        };
         self.send_info_request(input).await
     }
 
