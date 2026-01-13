@@ -153,15 +153,28 @@ impl ExchangeClient {
             info.meta().await?
         };
 
+        // Build coin_to_asset map
         let mut coin_to_asset = HashMap::new();
-        for (asset_ind, asset) in meta.universe.iter().enumerate() {
-            coin_to_asset.insert(asset.name.clone(), asset_ind as u32);
-        }
 
+        // Add original perp dex with offset 0
+        coin_to_asset = meta.add_to_coin_to_asset_map(coin_to_asset, 0);
+
+        // Add spot assets with offset 10000
         coin_to_asset = info
             .spot_meta()
             .await?
             .add_pair_and_name_to_index_map(coin_to_asset);
+
+        // Fetch and add all HIP3 perp dexes
+        // Builder-deployed perp dexs start at 110000, each subsequent dex gets +10000 offset
+        let all_perp_dexs = info.perp_dexs().await?;
+        for (i, dex_info) in all_perp_dexs.iter().skip(1).enumerate() {
+            if let Some(dex) = dex_info {
+                let offset = 110000 + (i as u32) * 10000;
+                let dex_meta = info.meta_with_dex(&dex.name).await?;
+                coin_to_asset = dex_meta.add_to_coin_to_asset_map(coin_to_asset, offset);
+            }
+        }
 
         Ok(ExchangeClient {
             wallet,

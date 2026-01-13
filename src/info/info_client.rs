@@ -12,7 +12,7 @@ use crate::{
         L2SnapshotResponse, OpenOrdersResponse, OrderInfo, RecentTradesResponse, UserFillsResponse,
         UserStateResponse,
     },
-    meta::{AssetContext, Meta, SpotMeta, SpotMetaAndAssetCtxs},
+    meta::{AssetContext, Meta, PerpDexInfo, SpotMeta, SpotMetaAndAssetCtxs},
     prelude::*,
     req::HttpClient,
     ws::{Subscription, WsManager},
@@ -121,6 +121,7 @@ pub enum InfoRequest {
         user: Address,
         coin: String,
     },
+    PerpDexs,
 }
 
 impl InfoRequest {
@@ -576,6 +577,14 @@ impl InfoClient {
         coin: String,
     ) -> Result<ActiveAssetDataResponse> {
         let input = InfoRequest::ActiveAssetData { user, coin };
+        self.send_info_request(input).await
+    }
+
+    /// Get the list of available HIP3 perp dexes.
+    /// Returns a list where the first element is None (original dex) and
+    /// subsequent elements are Some(PerpDexInfo) for builder-deployed dexes.
+    pub async fn perp_dexs(&self) -> Result<Vec<Option<PerpDexInfo>>> {
+        let input = InfoRequest::PerpDexs;
         self.send_info_request(input).await
     }
 }

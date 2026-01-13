@@ -113,3 +113,28 @@ pub struct TokenInfo {
     pub token_id: B128,
     pub is_canonical: bool,
 }
+
+/// Information about a HIP3 perp dex (builder-deployed perpetual exchange)
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PerpDexInfo {
+    pub name: String,
+    pub full_name: String,
+    pub deployer: String,
+    pub oracle_updater: Option<String>,
+    pub fee_recipient: Option<String>,
+}
+
+impl Meta {
+    /// Add perp assets to coin_to_asset map with the given offset
+    pub fn add_to_coin_to_asset_map(
+        &self,
+        mut coin_to_asset: HashMap<String, u32>,
+        offset: u32,
+    ) -> HashMap<String, u32> {
+        for (asset_ind, asset) in self.universe.iter().enumerate() {
+            coin_to_asset.insert(asset.name.clone(), offset + asset_ind as u32);
+        }
+        coin_to_asset
+    }
+}
