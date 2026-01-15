@@ -57,7 +57,10 @@ pub struct WsManager {
 #[serde(tag = "type")]
 #[serde(rename_all = "camelCase")]
 pub enum Subscription {
-    AllMids,
+    AllMids {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dex: Option<String>,
+    },
     Notification { user: Address },
     WebData2 { user: Address },
     Candle { coin: String, interval: String },
@@ -240,8 +243,7 @@ impl WsManager {
 
     fn get_identifier(message: &Message) -> Result<String> {
         match message {
-            Message::AllMids(_) => serde_json::to_string(&Subscription::AllMids)
-                .map_err(|e| Error::JsonParse(e.to_string())),
+            Message::AllMids(_) => Ok("allMids".to_string()),
             Message::User(_) => Ok("userEvents".to_string()),
             Message::UserFills(fills) => serde_json::to_string(&Subscription::UserFills {
                 user: fills.data.user,
@@ -493,18 +495,13 @@ impl WsManager {
     ) -> Result<u32> {
         let mut subscriptions = self.subscriptions.lock().await;
 
-        let identifier_entry = if let Subscription::UserEvents { user: _ } =
-            serde_json::from_str::<Subscription>(&identifier)
-                .map_err(|e| Error::JsonParse(e.to_string()))?
-        {
-            "userEvents".to_string()
-        } else if let Subscription::OrderUpdates { user: _ } =
-            serde_json::from_str::<Subscription>(&identifier)
-                .map_err(|e| Error::JsonParse(e.to_string()))?
-        {
-            "orderUpdates".to_string()
-        } else {
-            identifier.clone()
+        let subscription = serde_json::from_str::<Subscription>(&identifier)
+            .map_err(|e| Error::JsonParse(e.to_string()))?;
+        let identifier_entry = match subscription {
+            Subscription::UserEvents { .. } => "userEvents".to_string(),
+            Subscription::OrderUpdates { .. } => "orderUpdates".to_string(),
+            Subscription::AllMids { .. } => "allMids".to_string(),
+            _ => identifier.clone(),
         };
         let subscriptions = subscriptions
             .entry(identifier_entry.clone())
@@ -538,18 +535,13 @@ impl WsManager {
             .ok_or(Error::SubscriptionNotFound)?
             .clone();
 
-        let identifier_entry = if let Subscription::UserEvents { user: _ } =
-            serde_json::from_str::<Subscription>(&identifier)
-                .map_err(|e| Error::JsonParse(e.to_string()))?
-        {
-            "userEvents".to_string()
-        } else if let Subscription::OrderUpdates { user: _ } =
-            serde_json::from_str::<Subscription>(&identifier)
-                .map_err(|e| Error::JsonParse(e.to_string()))?
-        {
-            "orderUpdates".to_string()
-        } else {
-            identifier.clone()
+        let subscription = serde_json::from_str::<Subscription>(&identifier)
+            .map_err(|e| Error::JsonParse(e.to_string()))?;
+        let identifier_entry = match subscription {
+            Subscription::UserEvents { .. } => "userEvents".to_string(),
+            Subscription::OrderUpdates { .. } => "orderUpdates".to_string(),
+            Subscription::AllMids { .. } => "allMids".to_string(),
+            _ => identifier.clone(),
         };
 
         self.subscription_identifiers.remove(&subscription_id);

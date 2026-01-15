@@ -93,7 +93,7 @@ impl MarketMaker {
 
         // Subscribe to AllMids so we can market make around the mid price
         self.info_client
-            .subscribe(Subscription::AllMids, sender)
+            .subscribe(Subscription::AllMids { dex: None }, sender)
             .await
             .unwrap();
 

@@ -87,7 +87,10 @@ pub enum InfoRequest {
     },
     SpotMeta,
     SpotMetaAndAssetCtxs,
-    AllMids,
+    AllMids {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        dex: String,
+    },
     UserFills {
         user: Address,
     },
@@ -461,7 +464,16 @@ impl InfoClient {
     }
 
     pub async fn all_mids(&self) -> Result<HashMap<String, String>> {
-        let input = InfoRequest::AllMids;
+        let input = InfoRequest::AllMids {
+            dex: String::new(),
+        };
+        self.send_info_request(input).await
+    }
+
+    pub async fn all_mids_with_dex(&self, dex: &str) -> Result<HashMap<String, String>> {
+        let input = InfoRequest::AllMids {
+            dex: dex.to_string(),
+        };
         self.send_info_request(input).await
     }
 

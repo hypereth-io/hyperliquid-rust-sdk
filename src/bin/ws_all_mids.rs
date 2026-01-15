@@ -13,8 +13,9 @@ async fn main() {
     let mut info_client = InfoClient::new(None, Some(BaseUrl::Testnet)).await.unwrap();
 
     let (sender, mut receiver) = unbounded_channel();
+    // Subscribe to allMids. Use dex: Some("dex_name".to_string()) for a specific HIP-3 dex
     let subscription_id = info_client
-        .subscribe(Subscription::AllMids, sender)
+        .subscribe(Subscription::AllMids { dex: None }, sender)
         .await
         .unwrap();
 
