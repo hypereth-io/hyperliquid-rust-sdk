@@ -151,3 +151,18 @@ pub struct ActiveAssetDataResponse {
     pub available_to_trade: Vec<String>,
     pub mark_px: String,
 }
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum UserAbstractionState {
+    /// perp + spot balances combined
+    UnifiedAccount,
+    /// perp + spot balances combined
+    PortfolioMargin,
+    /// TODO: when does this appear?
+    Disabled,
+    /// perp + spot balances separate
+    Default,
+    /// perp + spot balances separate
+    DexAbstraction,
+}

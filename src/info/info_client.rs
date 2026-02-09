@@ -9,8 +9,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::{
     info::{
         ActiveAssetDataResponse, CandlesSnapshotResponse, FundingHistoryResponse,
-        L2SnapshotResponse, OpenOrdersResponse, OrderInfo, RecentTradesResponse, UserFillsResponse,
-        UserStateResponse,
+        L2SnapshotResponse, OpenOrdersResponse, OrderInfo, RecentTradesResponse,
+        UserAbstractionState, UserFillsResponse, UserStateResponse,
     },
     meta::{AssetContext, Meta, PerpDexInfo, SpotMeta, SpotMetaAndAssetCtxs},
     prelude::*,
@@ -127,6 +127,9 @@ pub enum InfoRequest {
         coin: String,
     },
     PerpDexs,
+    UserAbstraction {
+        user: Address,
+    },
 }
 
 impl InfoRequest {
@@ -614,6 +617,13 @@ impl InfoClient {
     /// subsequent elements are Some(PerpDexInfo) for builder-deployed dexes.
     pub async fn perp_dexs(&self) -> Result<Vec<Option<PerpDexInfo>>> {
         let input = InfoRequest::PerpDexs;
+        self.send_info_request(input).await
+    }
+
+    /// Get the abstraction state for a user.
+    /// Returns the user's current margin/trading mode configuration.
+    pub async fn user_abstraction(&self, address: Address) -> Result<UserAbstractionState> {
+        let input = InfoRequest::UserAbstraction { user: address };
         self.send_info_request(input).await
     }
 }
