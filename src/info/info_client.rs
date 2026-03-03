@@ -4,7 +4,7 @@ use alloy::primitives::Address;
 use futures_util::future::select_all;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 use crate::{
     info::{
@@ -225,7 +225,7 @@ impl InfoClient {
     pub async fn subscribe(
         &mut self,
         subscription: Subscription,
-        sender_channel: UnboundedSender<Message>,
+        sender_channel: Sender<Message>,
     ) -> Result<u32> {
         if self.ws_manager.is_none() {
             let ws_url = format!("ws{}/ws", &self.http_client.base_url[4..]);

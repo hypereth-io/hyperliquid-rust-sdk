@@ -1,6 +1,6 @@
 use alloy::{primitives::Address, signers::local::PrivateKeySigner};
 use log::{error, info};
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::channel;
 
 use crate::{
     bps_diff, truncate_float, BaseUrl, ClientCancelRequest, ClientLimit, ClientOrder,
@@ -78,7 +78,7 @@ impl MarketMaker {
     }
 
     pub async fn start(&mut self) {
-        let (sender, mut receiver) = unbounded_channel();
+        let (sender, mut receiver) = channel(256);
 
         // Subscribe to UserEvents for fills
         self.info_client

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     net::TcpStream,
     spawn,
-    sync::{mpsc::UnboundedSender, oneshot, Mutex},
+    sync::{mpsc::Sender, oneshot, Mutex},
     time,
 };
 use tokio_tungstenite::{
@@ -37,7 +37,7 @@ use crate::{
 
 #[derive(Debug)]
 struct SubscriptionData {
-    sending_channel: UnboundedSender<Message>,
+    sending_channel: Sender<Message>,
     subscription_id: u32,
     id: String,
 }
@@ -404,12 +404,14 @@ impl WsManager {
                     let mut res = Ok(());
                     if let Some(subscription_datas) = subscriptions.get_mut(&identifier) {
                         for subscription_data in subscription_datas {
-                            if let Err(e) = subscription_data
-                                .sending_channel
-                                .send(message.clone())
-                                .map_err(|e| Error::WsSend(e.to_string()))
-                            {
-                                res = Err(e);
+                            match subscription_data.sending_channel.try_send(message.clone()) {
+                                Ok(()) => {}
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                    warn!("Subscription channel full, dropping message");
+                                }
+                                Err(e) => {
+                                    res = Err(Error::WsSend(e.to_string()));
+                                }
                             }
                         }
                     }
@@ -443,12 +445,14 @@ impl WsManager {
         let mut res = Ok(());
         for subscription_datas in subscriptions.values_mut() {
             for subscription_data in subscription_datas {
-                if let Err(e) = subscription_data
-                    .sending_channel
-                    .send(message.clone())
-                    .map_err(|e| Error::WsSend(e.to_string()))
-                {
-                    res = Err(e);
+                match subscription_data.sending_channel.try_send(message.clone()) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        warn!("Subscription channel full, dropping message");
+                    }
+                    Err(e) => {
+                        res = Err(Error::WsSend(e.to_string()));
+                    }
                 }
             }
         }
@@ -491,7 +495,7 @@ impl WsManager {
     pub(crate) async fn add_subscription(
         &mut self,
         identifier: String,
-        sending_channel: UnboundedSender<Message>,
+        sending_channel: Sender<Message>,
     ) -> Result<u32> {
         let mut subscriptions = self.subscriptions.lock().await;
 

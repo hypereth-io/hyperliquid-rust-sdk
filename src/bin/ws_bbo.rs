@@ -2,7 +2,7 @@ use hyperliquid_rust_sdk::{BaseUrl, InfoClient, Message, Subscription};
 use log::info;
 use tokio::{
     spawn,
-    sync::mpsc::unbounded_channel,
+    sync::mpsc::channel,
     time::{sleep, Duration},
 };
 
@@ -12,7 +12,7 @@ async fn main() {
     let mut info_client = InfoClient::new(None, Some(BaseUrl::Testnet)).await.unwrap();
     let coin = "BTC".to_string();
 
-    let (sender, mut receiver) = unbounded_channel();
+    let (sender, mut receiver) = channel(256);
     let subscription_id = info_client
         .subscribe(Subscription::Bbo { coin }, sender)
         .await

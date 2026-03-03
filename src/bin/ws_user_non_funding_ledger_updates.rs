@@ -3,7 +3,7 @@ use hyperliquid_rust_sdk::{BaseUrl, InfoClient, Message, Subscription};
 use log::info;
 use tokio::{
     spawn,
-    sync::mpsc::unbounded_channel,
+    sync::mpsc::channel,
     time::{sleep, Duration},
 };
 
@@ -13,7 +13,7 @@ async fn main() {
     let mut info_client = InfoClient::new(None, Some(BaseUrl::Testnet)).await.unwrap();
     let user = address!("0xc64cc00b46101bd40aa1c3121195e85c0b0918d8");
 
-    let (sender, mut receiver) = unbounded_channel();
+    let (sender, mut receiver) = channel(256);
     let subscription_id = info_client
         .subscribe(Subscription::UserNonFundingLedgerUpdates { user }, sender)
         .await
