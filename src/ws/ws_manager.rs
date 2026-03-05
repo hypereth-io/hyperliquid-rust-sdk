@@ -164,30 +164,82 @@ impl WsManager {
                                     reader = new_reader;
                                     let mut writer_guard = writer.lock().await;
                                     *writer_guard = new_writer;
-                                    for (identifier, v) in subscriptions_copy.lock().await.iter() {
-                                        // TODO should these special keys be removed and instead use the simpler direct identifier mapping?
-                                        if identifier.eq("userEvents")
-                                            || identifier.eq("orderUpdates")
-                                        {
-                                            for subscription_data in v {
-                                                if let Err(err) = Self::subscribe(
-                                                    writer_guard.deref_mut(),
-                                                    &subscription_data.id,
-                                                )
-                                                .await
+
+                                    // Collect identifiers and subscription IDs to resubscribe
+                                    let resub_items: Vec<(String, Vec<String>)> = {
+                                        let subs = subscriptions_copy.lock().await;
+                                        subs.iter()
+                                            .map(|(identifier, v)| {
+                                                let ids: Vec<String> = if identifier == "userEvents"
+                                                    || identifier == "orderUpdates"
                                                 {
-                                                    error!(
-                                                        "Could not resubscribe {identifier}: {err}"
-                                                    );
-                                                }
+                                                    v.iter().map(|sd| sd.id.clone()).collect()
+                                                } else {
+                                                    vec![identifier.clone()]
+                                                };
+                                                (identifier.clone(), ids)
+                                            })
+                                            .collect()
+                                    };
+
+                                    let mut failed_items: Vec<(String, String)> = Vec::new();
+                                    for (identifier, sub_ids) in &resub_items {
+                                        for sub_id in sub_ids {
+                                            if let Err(err) = Self::subscribe(
+                                                writer_guard.deref_mut(),
+                                                sub_id,
+                                            )
+                                            .await
+                                            {
+                                                error!(
+                                                    "Could not resubscribe {identifier}: {err}"
+                                                );
+                                                failed_items.push((identifier.clone(), sub_id.clone()));
                                             }
-                                        } else if let Err(err) =
-                                            Self::subscribe(writer_guard.deref_mut(), identifier)
-                                                .await
-                                        {
-                                            error!("Could not resubscribe correctly {identifier}: {err}");
                                         }
                                     }
+
+                                    // Retry failed resubscriptions with backoff
+                                    const RESUB_MAX_RETRIES: u32 = 3;
+                                    const RESUB_RETRY_DELAY_MS: u64 = 1000;
+                                    for attempt in 1..=RESUB_MAX_RETRIES {
+                                        if failed_items.is_empty() {
+                                            break;
+                                        }
+                                        let delay = RESUB_RETRY_DELAY_MS * 2u64.pow(attempt - 1);
+                                        warn!(
+                                            "Retrying {} failed resubscriptions (attempt {}/{})",
+                                            failed_items.len(), attempt, RESUB_MAX_RETRIES
+                                        );
+                                        tokio::time::sleep(Duration::from_millis(delay)).await;
+
+                                        let mut still_failed = Vec::new();
+                                        for (identifier, sub_id) in failed_items {
+                                            if let Err(err) = Self::subscribe(
+                                                writer_guard.deref_mut(),
+                                                &sub_id,
+                                            )
+                                            .await
+                                            {
+                                                error!(
+                                                    "Resubscribe retry failed for {identifier}: {err}"
+                                                );
+                                                still_failed.push((identifier, sub_id));
+                                            } else {
+                                                info!("Resubscribe retry succeeded for {identifier}");
+                                            }
+                                        }
+                                        failed_items = still_failed;
+                                    }
+
+                                    if !failed_items.is_empty() {
+                                        error!(
+                                            "Failed to resubscribe {} channels after all retries: {:?}",
+                                            failed_items.len(),
+                                            failed_items.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>()
+                                        );
+                                    }
+
                                     info!("WsManager reconnect finished");
                                 }
                                 Err(err) => error!("Could not connect to websocket {err}"),
@@ -493,43 +545,102 @@ impl WsManager {
         Self::send_subscription_data("unsubscribe", writer, identifier).await
     }
 
+    /// Maximum number of retry attempts when sending a subscription message fails
+    const SUBSCRIBE_MAX_RETRIES: u32 = 3;
+    /// Initial delay between subscription retries (doubles each attempt)
+    const SUBSCRIBE_RETRY_DELAY_MS: u64 = 2000;
+
     pub(crate) async fn add_subscription(
         &mut self,
         identifier: String,
         sending_channel: Sender<Message>,
     ) -> Result<u32> {
-        let mut subscriptions = self.subscriptions.lock().await;
+        let need_send;
+        let subscription_id;
 
-        let subscription = serde_json::from_str::<Subscription>(&identifier)
-            .map_err(|e| Error::JsonParse(e.to_string()))?;
-        let identifier_entry = match subscription {
-            Subscription::UserEvents { .. } => "userEvents".to_string(),
-            Subscription::OrderUpdates { .. } => "orderUpdates".to_string(),
-            Subscription::AllMids { .. } => "allMids".to_string(),
-            _ => identifier.clone(),
-        };
-        let subscriptions = subscriptions
-            .entry(identifier_entry.clone())
-            .or_insert(Vec::new());
+        // Scope the lock so it's released before the retry loop
+        {
+            let mut subscriptions_map = self.subscriptions.lock().await;
 
-        if !subscriptions.is_empty() && identifier_entry.eq("userEvents") {
-            return Err(Error::UserEvents);
+            let subscription = serde_json::from_str::<Subscription>(&identifier)
+                .map_err(|e| Error::JsonParse(e.to_string()))?;
+            let identifier_entry = match subscription {
+                Subscription::UserEvents { .. } => "userEvents".to_string(),
+                Subscription::OrderUpdates { .. } => "orderUpdates".to_string(),
+                Subscription::AllMids { .. } => "allMids".to_string(),
+                _ => identifier.clone(),
+            };
+            let subs = subscriptions_map
+                .entry(identifier_entry.clone())
+                .or_insert(Vec::new());
+
+            if !subs.is_empty() && identifier_entry.eq("userEvents") {
+                return Err(Error::UserEvents);
+            }
+
+            need_send = subs.is_empty();
+
+            // Store subscription BEFORE sending so reconnection logic can
+            // resubscribe even if the initial send fails due to broken connection.
+            subscription_id = self.subscription_id;
+            self.subscription_identifiers
+                .insert(subscription_id, identifier.clone());
+            subs.push(SubscriptionData {
+                sending_channel,
+                subscription_id,
+                id: identifier.clone(),
+            });
+            self.subscription_id += 1;
         }
 
-        if subscriptions.is_empty() {
-            Self::subscribe(self.writer.lock().await.borrow_mut(), identifier.as_str()).await?;
+        // Now try to send the subscribe message (only if this is the first
+        // subscriber for this channel). Lock is released so the reader task
+        // can operate during retries.
+        if need_send {
+
+            let mut last_err = None;
+            for attempt in 0..=Self::SUBSCRIBE_MAX_RETRIES {
+                match Self::subscribe(self.writer.lock().await.borrow_mut(), identifier.as_str())
+                    .await
+                {
+                    Ok(()) => {
+                        if attempt > 0 {
+                            info!(
+                                "Subscription send succeeded on retry {} for {}",
+                                attempt, identifier
+                            );
+                        }
+                        last_err = None;
+                        break;
+                    }
+                    Err(err) => {
+                        warn!(
+                            "Failed to send subscribe for {} (attempt {}/{}): {}",
+                            identifier,
+                            attempt + 1,
+                            Self::SUBSCRIBE_MAX_RETRIES + 1,
+                            err
+                        );
+                        last_err = Some(err);
+                        if attempt < Self::SUBSCRIBE_MAX_RETRIES {
+                            let delay =
+                                Self::SUBSCRIBE_RETRY_DELAY_MS * 2u64.pow(attempt);
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                        }
+                    }
+                }
+            }
+
+            if let Some(err) = last_err {
+                // All retries exhausted. The subscription is still stored in the
+                // map so reconnection will pick it up automatically.
+                warn!(
+                    "All subscribe retries exhausted for {}, will rely on reconnection: {}",
+                    identifier, err
+                );
+            }
         }
 
-        let subscription_id = self.subscription_id;
-        self.subscription_identifiers
-            .insert(subscription_id, identifier.clone());
-        subscriptions.push(SubscriptionData {
-            sending_channel,
-            subscription_id,
-            id: identifier,
-        });
-
-        self.subscription_id += 1;
         Ok(subscription_id)
     }
 
