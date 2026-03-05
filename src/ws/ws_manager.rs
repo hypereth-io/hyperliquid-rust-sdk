@@ -10,6 +10,7 @@ use std::{
 };
 
 use alloy::primitives::Address;
+use crate::warn_throttled;
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -407,7 +408,7 @@ impl WsManager {
                             match subscription_data.sending_channel.try_send(message.clone()) {
                                 Ok(()) => {}
                                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                    warn!("Subscription channel full, dropping message");
+                                    warn_throttled!(300, "Subscription channel full, dropping message");
                                 }
                                 Err(e) => {
                                     res = Err(Error::WsSend(e.to_string()));
@@ -448,7 +449,7 @@ impl WsManager {
                 match subscription_data.sending_channel.try_send(message.clone()) {
                     Ok(()) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        warn!("Subscription channel full, dropping message");
+                        warn_throttled!(300, "Subscription channel full, dropping message");
                     }
                     Err(e) => {
                         res = Err(Error::WsSend(e.to_string()));

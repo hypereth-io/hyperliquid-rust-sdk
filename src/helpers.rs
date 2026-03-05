@@ -7,6 +7,40 @@ use uuid::Uuid;
 
 use crate::consts::*;
 
+/// Like `log::warn!` but throttled so it fires at most once per `$secs` seconds.
+/// Each call-site gets its own independent timer and suppressed counter.
+/// When the message fires after suppression, it reports how many were suppressed.
+#[macro_export]
+macro_rules! warn_throttled {
+    ($secs:expr, $($arg:tt)+) => {{
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Instant;
+        use std::sync::Mutex;
+        static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+        static SUPPRESSED_COUNT: AtomicU64 = AtomicU64::new(0);
+        let now = Instant::now();
+        let should_log = {
+            let mut last = LAST.lock().unwrap();
+            if last.map_or(true, |t| now.duration_since(t) >= std::time::Duration::from_secs($secs)) {
+                *last = Some(now);
+                true
+            } else {
+                false
+            }
+        };
+        if should_log {
+            let suppressed = SUPPRESSED_COUNT.swap(0, Ordering::Relaxed);
+            if suppressed > 0 {
+                log::warn!("(throttled, {} similar messages suppressed) {}", suppressed, format_args!($($arg)+));
+            } else {
+                log::warn!($($arg)+);
+            }
+        } else {
+            SUPPRESSED_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+    }};
+}
+
 fn now_timestamp_ms() -> u64 {
     let now = Utc::now();
     now.timestamp_millis() as u64
