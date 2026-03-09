@@ -92,6 +92,8 @@ pub struct AssetMeta {
     pub max_leverage: usize,
     #[serde(default)]
     pub only_isolated: Option<bool>,
+    #[serde(default)]
+    pub is_delisted: Option<bool>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
