@@ -18,6 +18,7 @@ use tokio::{
     net::TcpStream,
     spawn,
     sync::{mpsc::Sender, oneshot, Mutex},
+    task::JoinHandle,
     time,
 };
 use tokio_tungstenite::{
@@ -52,6 +53,9 @@ pub struct WsManager {
     // Request/response tracking
     request_counter: Arc<AtomicU32>,
     pending_requests: Arc<Mutex<HashMap<u32, oneshot::Sender<serde_json::Value>>>>,
+    // Task handles for cleanup on drop
+    reader_handle: Option<JoinHandle<()>>,
+    ping_handle: Option<JoinHandle<()>>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -129,7 +133,7 @@ impl WsManager {
         let pending_requests = Arc::new(Mutex::new(HashMap::new()));
         let pending_requests_copy = Arc::clone(&pending_requests);
 
-        {
+        let reader_handle = {
             let writer = writer.clone();
             let stop_flag = Arc::clone(&stop_flag);
             let reader_fut = async move {
@@ -252,10 +256,12 @@ impl WsManager {
                 }
                 warn!("ws message reader task stopped");
             };
-            spawn(reader_fut);
-        }
+            let reader_handle = spawn(reader_fut);
 
-        {
+            reader_handle
+        };
+
+        let ping_handle = {
             let stop_flag = Arc::clone(&stop_flag);
             let writer = Arc::clone(&writer);
             let ping_fut = async move {
@@ -273,8 +279,8 @@ impl WsManager {
                 }
                 warn!("ws ping task stopped");
             };
-            spawn(ping_fut);
-        }
+            spawn(ping_fut)
+        };
 
         Ok(WsManager {
             stop_flag,
@@ -284,6 +290,8 @@ impl WsManager {
             subscription_identifiers: HashMap::new(),
             request_counter: Arc::new(AtomicU32::new(0)),
             pending_requests,
+            reader_handle: Some(reader_handle),
+            ping_handle: Some(ping_handle),
         })
     }
 
@@ -723,5 +731,11 @@ impl WsManager {
 impl Drop for WsManager {
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.reader_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.ping_handle.take() {
+            handle.abort();
+        }
     }
 }
