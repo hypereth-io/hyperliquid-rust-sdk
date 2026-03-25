@@ -4,8 +4,11 @@ use alloy::primitives::B128;
 use serde::Deserialize;
 
 #[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct Meta {
     pub universe: Vec<AssetMeta>,
+    #[serde(default)]
+    pub collateral_token: Option<u32>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
