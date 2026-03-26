@@ -152,6 +152,136 @@ pub struct ActiveAssetDataResponse {
     pub mark_px: String,
 }
 
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtraAgentResponse {
+    pub name: String,
+    pub address: Address,
+    pub valid_until: u64,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SubAccountResponse {
+    pub name: String,
+    pub sub_account_user: Address,
+    pub master: Address,
+    pub clearinghouse_state: Option<UserStateResponse>,
+    pub spot_state: Option<UserTokenBalanceResponse>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UserVaultEquity {
+    pub vault_address: Address,
+    pub equity: String,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UserRateLimitResponse {
+    pub cum_vlm: String,
+    pub n_requests_used: u64,
+    pub n_requests_cap: u64,
+    pub n_requests_surplus: u64,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegationResponse {
+    pub validator: Address,
+    pub amount: String,
+    pub locked_until_timestamp: u64,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegatorSummaryResponse {
+    pub delegated: String,
+    pub undelegated: String,
+    pub total_pending_withdrawal: String,
+    pub n_pending_withdrawals: u64,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PerpDeployAuctionStatusResponse {
+    pub start_time_seconds: u64,
+    pub duration_seconds: u64,
+    pub start_gas: String,
+    pub current_gas: Option<String>,
+    pub end_gas: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotDeploySpec {
+    pub name: String,
+    pub sz_decimals: u32,
+    pub wei_decimals: u32,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotDeployTokenState {
+    pub token: u64,
+    pub spec: SpotDeploySpec,
+    pub full_name: String,
+    pub spots: Vec<u64>,
+    pub max_supply: u64,
+    pub hyperliquidity_genesis_balance: String,
+    pub total_genesis_balance_wei: String,
+    pub user_genesis_balances: Vec<(String, String)>,
+    pub existing_token_genesis_balances: Vec<(u64, String)>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GasAuction {
+    pub start_time_seconds: u64,
+    pub duration_seconds: u64,
+    pub start_gas: String,
+    pub current_gas: Option<String>,
+    pub end_gas: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotDeployStateResponse {
+    pub states: Vec<SpotDeployTokenState>,
+    pub gas_auction: GasAuction,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+#[serde(tag = "role")]
+pub enum UserRoleResponse {
+    #[serde(rename = "missing")]
+    Missing,
+    #[serde(rename = "user")]
+    User,
+    #[serde(rename = "vault")]
+    Vault,
+    #[serde(rename = "agent")]
+    Agent {
+        data: AgentRoleData,
+    },
+    #[serde(rename = "subAccount")]
+    SubAccount {
+        data: SubAccountRoleData,
+    },
+}
+
+#[derive(Deserialize, Debug)]
+pub struct AgentRoleData {
+    pub user: Address,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct SubAccountRoleData {
+    pub master: Address,
+}
+
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum UserAbstractionState {

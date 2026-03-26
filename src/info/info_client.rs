@@ -8,9 +8,12 @@ use tokio::sync::mpsc::Sender;
 
 use crate::{
     info::{
-        ActiveAssetDataResponse, CandlesSnapshotResponse, FundingHistoryResponse,
-        L2SnapshotResponse, OpenOrdersResponse, OrderInfo, RecentTradesResponse,
-        UserAbstractionState, UserFillsResponse, UserStateResponse,
+        ActiveAssetDataResponse, BasicOrderInfo, CandlesSnapshotResponse,
+        DelegationResponse, DelegatorSummaryResponse, ExtraAgentResponse,
+        FundingHistoryResponse, L2SnapshotResponse, OpenOrdersResponse, OrderInfo,
+        PerpDeployAuctionStatusResponse, RecentTradesResponse, SpotDeployStateResponse,
+        SubAccountResponse, UserAbstractionState, UserFillsResponse, UserRateLimitResponse,
+        UserRoleResponse, UserStateResponse, UserVaultEquity,
     },
     meta::{AssetContext, Meta, PerpDexInfo, SpotMeta, SpotMetaAndAssetCtxs},
     prelude::*,
@@ -130,6 +133,41 @@ pub enum InfoRequest {
     UserAbstraction {
         user: Address,
     },
+    ExtraAgents {
+        user: Address,
+    },
+    FrontendOpenOrders {
+        user: Address,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        dex: String,
+    },
+    SubAccounts {
+        user: Address,
+    },
+    UserVaultEquities {
+        user: Address,
+    },
+    UserRateLimit {
+        user: Address,
+    },
+    UserRole {
+        user: Address,
+    },
+    MaxBuilderFee {
+        user: Address,
+        builder: Address,
+    },
+    Delegations {
+        user: Address,
+    },
+    DelegatorSummary {
+        user: Address,
+    },
+    PerpsAtOpenInterestCap,
+    PerpDeployAuctionStatus,
+    SpotDeployState {
+        user: Address,
+    },
 }
 
 impl InfoRequest {
@@ -137,9 +175,26 @@ impl InfoRequest {
     fn supports_parallel_query(&self) -> bool {
         matches!(
             self,
-            InfoRequest::UserState { .. }    // clearinghouseState
-            | InfoRequest::Meta { .. }       // meta
-            | InfoRequest::OpenOrders { .. } // openOrders
+            InfoRequest::Meta { .. }
+            | InfoRequest::SpotMeta
+            | InfoRequest::UserState { .. }
+            | InfoRequest::UserTokenBalances { .. }
+            | InfoRequest::OpenOrders { .. }
+            | InfoRequest::FrontendOpenOrders { .. }
+            | InfoRequest::ActiveAssetData { .. }
+            | InfoRequest::ExtraAgents { .. }
+            | InfoRequest::SubAccounts { .. }
+            | InfoRequest::UserVaultEquities { .. }
+            | InfoRequest::UserFees { .. }
+            | InfoRequest::UserRateLimit { .. }
+            | InfoRequest::UserRole { .. }
+            | InfoRequest::MaxBuilderFee { .. }
+            | InfoRequest::Delegations { .. }
+            | InfoRequest::DelegatorSummary { .. }
+            | InfoRequest::PerpsAtOpenInterestCap
+            | InfoRequest::PerpDeployAuctionStatus
+            | InfoRequest::SpotDeployState { .. }
+            | InfoRequest::PerpDexs
         )
     }
 }
@@ -624,6 +679,98 @@ impl InfoClient {
     /// Returns the user's current margin/trading mode configuration.
     pub async fn user_abstraction(&self, address: Address) -> Result<UserAbstractionState> {
         let input = InfoRequest::UserAbstraction { user: address };
+        self.send_info_request(input).await
+    }
+
+    /// Get the extra agents (sub-accounts/authorized agents) for a user.
+    pub async fn extra_agents(&self, address: Address) -> Result<Vec<ExtraAgentResponse>> {
+        let input = InfoRequest::ExtraAgents { user: address };
+        self.send_info_request(input).await
+    }
+
+    /// Get a user's open orders with additional frontend info (orderType, origSz, triggers, etc.).
+    pub async fn frontend_open_orders(
+        &self,
+        address: Address,
+    ) -> Result<Vec<BasicOrderInfo>> {
+        let input = InfoRequest::FrontendOpenOrders {
+            user: address,
+            dex: String::new(),
+        };
+        self.send_info_request(input).await
+    }
+
+    /// Get a user's open orders with additional frontend info for a specific dex.
+    pub async fn frontend_open_orders_with_dex(
+        &self,
+        address: Address,
+        dex: &str,
+    ) -> Result<Vec<BasicOrderInfo>> {
+        let input = InfoRequest::FrontendOpenOrders {
+            user: address,
+            dex: dex.to_string(),
+        };
+        self.send_info_request(input).await
+    }
+
+    /// Get a user's sub-accounts.
+    pub async fn sub_accounts(&self, address: Address) -> Result<Vec<SubAccountResponse>> {
+        let input = InfoRequest::SubAccounts { user: address };
+        self.send_info_request(input).await
+    }
+
+    /// Get a user's vault equity deposits.
+    pub async fn user_vault_equities(&self, address: Address) -> Result<Vec<UserVaultEquity>> {
+        let input = InfoRequest::UserVaultEquities { user: address };
+        self.send_info_request(input).await
+    }
+
+    /// Get a user's rate limit information.
+    pub async fn user_rate_limit(&self, address: Address) -> Result<UserRateLimitResponse> {
+        let input = InfoRequest::UserRateLimit { user: address };
+        self.send_info_request(input).await
+    }
+
+    /// Get a user's role (user, agent, vault, or subAccount).
+    pub async fn user_role(&self, address: Address) -> Result<UserRoleResponse> {
+        let input = InfoRequest::UserRole { user: address };
+        self.send_info_request(input).await
+    }
+
+    /// Get the maximum builder fee approved by a user for a specific builder.
+    /// Returns tenths of a basis point.
+    pub async fn max_builder_fee(&self, user: Address, builder: Address) -> Result<u64> {
+        let input = InfoRequest::MaxBuilderFee { user, builder };
+        self.send_info_request(input).await
+    }
+
+    /// Get a user's staking delegations.
+    pub async fn delegations(&self, address: Address) -> Result<Vec<DelegationResponse>> {
+        let input = InfoRequest::Delegations { user: address };
+        self.send_info_request(input).await
+    }
+
+    /// Get a user's staking summary.
+    pub async fn delegator_summary(&self, address: Address) -> Result<DelegatorSummaryResponse> {
+        let input = InfoRequest::DelegatorSummary { user: address };
+        self.send_info_request(input).await
+    }
+
+    /// Get the list of perps currently at their open interest cap.
+    pub async fn perps_at_open_interest_cap(&self) -> Result<Vec<String>> {
+        let input = InfoRequest::PerpsAtOpenInterestCap;
+        self.send_info_request(input).await
+    }
+
+    /// Get the perp deploy auction status.
+    pub async fn perp_deploy_auction_status(&self) -> Result<PerpDeployAuctionStatusResponse> {
+        let input = InfoRequest::PerpDeployAuctionStatus;
+        self.send_info_request(input).await
+    }
+
+    /// Get the spot deploy state for a user.
+    pub async fn spot_deploy_state(&self, address: Address) -> Result<SpotDeployStateResponse> {
+        let input = InfoRequest::SpotDeployState { user: address };
         self.send_info_request(input).await
     }
 }
