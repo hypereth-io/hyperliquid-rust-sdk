@@ -121,7 +121,7 @@ impl ExchangeClient {
         meta: Option<Meta>,
         vault_address: Option<Address>,
     ) -> Result<ExchangeClient> {
-        Self::new_internal(client, wallet, base_url, meta, vault_address, false).await
+        Self::new_internal(client, wallet, base_url, meta, None, vault_address, false).await
     }
 
     pub async fn with_reconnect(
@@ -131,7 +131,31 @@ impl ExchangeClient {
         meta: Option<Meta>,
         vault_address: Option<Address>,
     ) -> Result<ExchangeClient> {
-        Self::new_internal(client, wallet, base_url, meta, vault_address, true).await
+        Self::new_internal(client, wallet, base_url, meta, None, vault_address, true).await
+    }
+
+    /// Create an ExchangeClient with a pre-built coin_to_asset map.
+    /// This avoids all API calls during construction (meta, spotMeta, perpDexs,
+    /// meta_with_dex), which is useful when creating many clients that share
+    /// the same asset mapping.
+    pub async fn with_coin_to_asset(
+        client: Option<Client>,
+        wallet: PrivateKeySigner,
+        base_url: Option<BaseUrl>,
+        meta: Meta,
+        coin_to_asset: HashMap<String, u32>,
+        vault_address: Option<Address>,
+    ) -> Result<ExchangeClient> {
+        Self::new_internal(
+            client,
+            wallet,
+            base_url,
+            Some(meta),
+            Some(coin_to_asset),
+            vault_address,
+            true,
+        )
+        .await
     }
 
     async fn new_internal(
@@ -139,11 +163,31 @@ impl ExchangeClient {
         wallet: PrivateKeySigner,
         base_url: Option<BaseUrl>,
         meta: Option<Meta>,
+        coin_to_asset: Option<HashMap<String, u32>>,
         vault_address: Option<Address>,
         reconnect: bool,
     ) -> Result<ExchangeClient> {
         let client = client.unwrap_or_default();
         let base_url = base_url.unwrap_or(BaseUrl::Mainnet);
+
+        // If both meta and coin_to_asset are pre-built, skip all API calls
+        // (meta, spotMeta, perpDexs, per-dex metas). This is critical when
+        // creating many clients to stay within rate limits.
+        if let (Some(meta), Some(coin_to_asset)) = (meta.clone(), coin_to_asset) {
+            return Ok(ExchangeClient {
+                wallet,
+                meta,
+                vault_address,
+                http_client: HttpClient {
+                    client,
+                    base_url: base_url.get_url(),
+                    base_url_config: base_url,
+                },
+                coin_to_asset,
+                ws_manager: None,
+                reconnect,
+            });
+        }
 
         // Pass the client to InfoClient so it uses the same HTTP client with API key headers
         let info = InfoClient::new(Some(client.clone()), Some(base_url.clone())).await?;
